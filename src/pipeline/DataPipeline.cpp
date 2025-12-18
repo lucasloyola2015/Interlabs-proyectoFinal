@@ -1,6 +1,6 @@
 #include "DataPipeline.h"
-#include "FlashRing.h"
-#include "UartCapture.h"
+#include "../storage/FlashRing.h"
+#include "../transport/IDataSource.h"
 #include "esp_log.h"
 #include "freertos/semphr.h"
 #include <cstring>
@@ -11,6 +11,7 @@ namespace DataPipeline {
 
 // Module state
 static Config s_config;
+static IDataSource* s_dataSource = nullptr;
 static TaskHandle_t s_taskHandle = nullptr;
 static SemaphoreHandle_t s_flushSem = nullptr;
 static volatile bool s_running = false;
@@ -23,13 +24,18 @@ static Stats s_stats = {};
 // Task function
 static void writerTask(void *arg);
 
-esp_err_t init(const Config &config) {
+esp_err_t init(const Config &config, IDataSource* dataSource) {
+  if (!dataSource) {
+    ESP_LOGE(TAG, "DataSource is null");
+    return ESP_ERR_INVALID_ARG;
+  }
   if (s_initialized) {
     ESP_LOGW(TAG, "Already initialized");
     return ESP_OK;
   }
 
   s_config = config;
+  s_dataSource = dataSource;
   memset(&s_stats, 0, sizeof(s_stats));
   s_stopRequested = false;
 
@@ -145,7 +151,13 @@ void deinit() {
 // --- Task implementation ---
 
 static void writerTask(void *arg) {
-  RingbufHandle_t ringBuf = UartCapture::getRingBuffer();
+  if (!s_dataSource) {
+    ESP_LOGE(TAG, "DataSource not initialized!");
+    vTaskDelete(nullptr);
+    return;
+  }
+
+  RingbufHandle_t ringBuf = s_dataSource->getRingBuffer();
 
   if (!ringBuf) {
     ESP_LOGE(TAG, "No ring buffer available!");

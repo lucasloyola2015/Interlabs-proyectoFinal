@@ -1,11 +1,11 @@
 /**
- * ESP32 DataLogger - High Speed UART to Flash
+ * ESP32 DataLogger - High Speed Data Capture to Flash
  *
- * Captures data from UART2 at 1Mbps and stores to internal flash
- * using a circular buffer with wear leveling.
+ * Captures data from various transports (UART, Parallel Port) and stores
+ * to internal flash using a circular buffer with wear leveling.
  *
  * Architecture:
- * - Core 0: UART capture task
+ * - Core 0: Transport capture task (UART/PP)
  * - Core 1: Flash writer task
  * - Ring buffer in RAM bridges the two
  */
@@ -17,46 +17,29 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <stdarg.h>
 
-#include "DataPipeline.h"
-#include "FlashRing.h"
-#include "UartCapture.h"
+#include "config/AppConfig.h"
+#include "config/ConfigManager.h"
+#include "pipeline/DataPipeline.h"
+#include "storage/FlashRing.h"
+#include "transport/IDataSource.h"
+#include "transport/uart/UartCapture.h"
+#include "transport/parallel/ParallelPortCapture.h"
+#include "utils/LogFormatter.h"
 
 static const char *TAG = "DataLogger";
 
-// Custom log formatter that removes timestamp
-static int custom_log_vprintf(const char *fmt, va_list args) {
-  char buffer[512];
-  int len = vsnprintf(buffer, sizeof(buffer), fmt, args);
-  
-  if (len <= 0 || len >= (int)sizeof(buffer)) {
-    return vprintf(fmt, args);
-  }
-  
-  // Remove timestamp pattern: "I (12345) " -> "I "
-  // Format is typically: "LEVEL (TIMESTAMP) TAG: message"
-  if (buffer[0] == 'E' || buffer[0] == 'W' || buffer[0] == 'I' || 
-      buffer[0] == 'D' || buffer[0] == 'V') {
-    // Look for pattern: level char, space, '(', digits, ')', space
-    if (len > 2 && buffer[1] == ' ' && buffer[2] == '(') {
-      char *closeParen = strchr(buffer + 2, ')');
-      if (closeParen && closeParen[1] == ' ') {
-        // Remove "(TIMESTAMP) " part: keep level char and space, skip to after ') '
-        memmove(buffer + 1, closeParen + 2, strlen(closeParen + 2) + 1);
-      }
-    }
-  }
-  
-  return printf("%s", buffer);
-}
+// Global transport instance
+static IDataSource* g_dataSource = nullptr;
 
 // Command processing via debug UART (UART0/USB)
 static void processCommand(const char *cmd) {
   if (strcmp(cmd, "format") == 0 || strcmp(cmd, "erase") == 0) {
     ESP_LOGI(TAG, "Erasing flash and resetting stats...");
     if (FlashRing::erase() == ESP_OK) {
-      UartCapture::resetStats();
+      if (g_dataSource) {
+        g_dataSource->resetStats();
+      }
       DataPipeline::resetStats();
       ESP_LOGI(TAG, "Flash erased and stats reset!");
     } else {
@@ -65,13 +48,17 @@ static void processCommand(const char *cmd) {
   } else if (strcmp(cmd, "stats") == 0) {
     FlashRing::Stats fs;
     FlashRing::getStats(&fs);
-    UartCapture::Stats us;
-    UartCapture::getStats(&us);
     ESP_LOGI(TAG, "Flash: %u/%u bytes (%u%%), wraps=%lu",
              fs.usedBytes, fs.partitionSize,
              (fs.usedBytes * 100) / fs.partitionSize, fs.wrapCount);
-    ESP_LOGI(TAG, "UART: total=%lu, bursts=%lu, overflows=%lu",
-             us.totalBytesReceived, us.burstCount, us.overflowCount);
+    
+    if (g_dataSource) {
+      Transport::Stats ts;
+      if (g_dataSource->getStats(&ts) == ESP_OK) {
+        ESP_LOGI(TAG, "Transport: total=%lu, bursts=%lu, overflows=%lu",
+                 ts.totalBytesReceived, ts.burstCount, ts.overflowCount);
+      }
+    }
   } else if (strncmp(cmd, "read ", 5) == 0) {
     // Parse: read <offset> <length>
     unsigned int offset = 0, len = 0;
@@ -100,25 +87,82 @@ static void processCommand(const char *cmd) {
       ESP_LOGW(TAG, "Usage: read <offset> <length>");
     }
   } else if (strncmp(cmd, "baud ", 5) == 0) {
-    // Parse: baud <baudrate>
-    unsigned int newBaud = 0;
-    if (sscanf(cmd + 5, "%u", &newBaud) == 1) {
-      if (UartCapture::setBaudRate(newBaud) == ESP_OK) {
-        ESP_LOGI(TAG, "Baudrate set to %u", newBaud);
-        printf("BAUD_OK %u\n", newBaud);
+    // Parse: baud <baudrate> (UART only)
+    if (g_dataSource && g_dataSource->getType() == Transport::Type::UART) {
+      unsigned int newBaud = 0;
+      if (sscanf(cmd + 5, "%u", &newBaud) == 1) {
+        UartCapture* uart = static_cast<UartCapture*>(g_dataSource);
+        if (uart->setBaudRate(newBaud) == ESP_OK) {
+          // Update config in NVS
+          ConfigManager::UartConfig uartConfig;
+          if (ConfigManager::getUartConfig(&uartConfig) == ESP_OK) {
+            uartConfig.baudRate = newBaud;
+            ConfigManager::saveUartConfig(&uartConfig);
+          }
+          ESP_LOGI(TAG, "Baudrate set to %u", newBaud);
+          printf("BAUD_OK %u\n", newBaud);
+        } else {
+          ESP_LOGE(TAG, "Failed to set baudrate");
+          printf("BAUD_FAIL\n");
+        }
       } else {
-        ESP_LOGE(TAG, "Failed to set baudrate");
-        printf("BAUD_FAIL\n");
+        ESP_LOGW(TAG, "Usage: baud <baudrate>");
       }
     } else {
-      ESP_LOGW(TAG, "Usage: baud <baudrate>");
+      ESP_LOGW(TAG, "Baudrate command only available for UART transport");
     }
   } else if (strcmp(cmd, "baud") == 0) {
-    uint32_t currentBaud = UartCapture::getBaudRate();
-    ESP_LOGI(TAG, "Current baudrate: %lu", currentBaud);
-    printf("BAUD %lu\n", currentBaud);
+    if (g_dataSource && g_dataSource->getType() == Transport::Type::UART) {
+      UartCapture* uart = static_cast<UartCapture*>(g_dataSource);
+      uint32_t currentBaud = uart->getBaudRate();
+      ESP_LOGI(TAG, "Current baudrate: %lu", currentBaud);
+      printf("BAUD %lu\n", currentBaud);
+    } else {
+      ESP_LOGW(TAG, "Baudrate command only available for UART transport");
+    }
+  } else if (strcmp(cmd, "config") == 0) {
+    // Show current configuration
+    ConfigManager::AppConfig config;
+    if (ConfigManager::getConfig(&config) == ESP_OK) {
+      ESP_LOGI(TAG, "Transport: %s", 
+               config.transportType == Transport::Type::UART ? "UART" : "PARALLEL_PORT");
+      if (config.transportType == Transport::Type::UART) {
+        ESP_LOGI(TAG, "UART: port=%d, rx=%d, tx=%d, baud=%lu, data=%d, parity=%d, stop=%d",
+                 config.uart.uartPort, config.uart.rxPin, config.uart.txPin,
+                 config.uart.baudRate, config.uart.dataBits, config.uart.parity, config.uart.stopBits);
+      } else {
+        ESP_LOGI(TAG, "PP: strobe=%d, active=%s, data=[%d,%d,%d,%d,%d,%d,%d,%d]",
+                 config.parallelPort.strobePin,
+                 config.parallelPort.strobeActiveHigh ? "high" : "low",
+                 config.parallelPort.dataPins[0], config.parallelPort.dataPins[1],
+                 config.parallelPort.dataPins[2], config.parallelPort.dataPins[3],
+                 config.parallelPort.dataPins[4], config.parallelPort.dataPins[5],
+                 config.parallelPort.dataPins[6], config.parallelPort.dataPins[7]);
+      }
+    }
+  } else if (strncmp(cmd, "transport ", 10) == 0) {
+    // Parse: transport <uart|pp>
+    const char* typeStr = cmd + 10;
+    Transport::Type newType;
+    if (strcmp(typeStr, "uart") == 0) {
+      newType = Transport::Type::UART;
+    } else if (strcmp(typeStr, "pp") == 0 || strcmp(typeStr, "parallel") == 0) {
+      newType = Transport::Type::PARALLEL_PORT;
+    } else {
+      ESP_LOGW(TAG, "Usage: transport <uart|pp>");
+      return;
+    }
+    
+    if (ConfigManager::setTransportType(newType) == ESP_OK) {
+      ESP_LOGI(TAG, "Transport type set to %s (reboot required)", 
+               newType == Transport::Type::UART ? "UART" : "PARALLEL_PORT");
+      printf("TRANSPORT_OK %s\n", newType == Transport::Type::UART ? "UART" : "PP");
+    } else {
+      ESP_LOGE(TAG, "Failed to set transport type");
+      printf("TRANSPORT_FAIL\n");
+    }
   } else if (strcmp(cmd, "help") == 0) {
-    ESP_LOGI(TAG, "Commands: format, stats, read <offset> <len>, baud [rate], help");
+    ESP_LOGI(TAG, "Commands: format, stats, read <offset> <len>, baud [rate], config, transport <uart|pp>, help");
   } else if (strlen(cmd) > 0) {
     ESP_LOGW(TAG, "Unknown command: %s (type 'help')", cmd);
   }
@@ -145,7 +189,6 @@ static void cmdTask(void *arg) {
   }
 }
 
-
 // Burst callback - called when a data burst ends
 static void onBurstEnd(bool ended, size_t bytes) {
   if (ended) {
@@ -163,9 +206,17 @@ extern "C" void app_main(void) {
   ESP_LOGI(TAG, "======================================");
   ESP_LOGI(TAG, "Free heap: %lu bytes", esp_get_free_heap_size());
 
+  // Initialize ConfigManager (loads from NVS)
+  ESP_LOGI(TAG, "Initializing ConfigManager...");
+  esp_err_t ret = ConfigManager::init();
+  if (ret != ESP_OK) {
+    ESP_LOGE(TAG, "ConfigManager init failed!");
+    return;
+  }
+
   // Initialize FlashRing
   ESP_LOGI(TAG, "Initializing FlashRing...");
-  esp_err_t ret = FlashRing::init("datalog");
+  ret = FlashRing::init("datalog");
   if (ret != ESP_OK) {
     ESP_LOGE(TAG, "FlashRing init failed!");
     return;
@@ -177,24 +228,71 @@ extern "C" void app_main(void) {
   ESP_LOGI(TAG, "Flash partition: %u bytes, used: %u bytes",
            flashStats.partitionSize, flashStats.usedBytes);
 
-  // Initialize UART capture
-  ESP_LOGI(TAG, "Initializing UartCapture...");
-  UartCapture::Config uartConfig;
-  uartConfig.uartPort = UART_NUM_2;
-  uartConfig.rxPin = 16;
-  uartConfig.baudRate = 115200; // 115200 bps
-  uartConfig.rxBufSize = 32 * 1024;   // 32KB hardware buffer
-  uartConfig.ringBufSize = 64 * 1024; // 64KB ring buffer
-  uartConfig.timeoutMs = 100;
-
-  ret = UartCapture::init(uartConfig);
+  // Load configuration from NVS
+  ConfigManager::AppConfig appConfig;
+  ret = ConfigManager::getConfig(&appConfig);
   if (ret != ESP_OK) {
-    ESP_LOGE(TAG, "UartCapture init failed!");
+    ESP_LOGE(TAG, "Failed to load configuration!");
     return;
   }
 
-  // Set burst callback
-  UartCapture::setBurstCallback(onBurstEnd);
+  // Initialize transport based on configuration from NVS
+  ESP_LOGI(TAG, "Initializing transport...");
+  
+  if (appConfig.transportType == Transport::Type::UART) {
+    // Initialize UART transport
+    static UartCapture uartCapture;
+    UartCapture::Config uartConfig;
+    uartConfig.uartPort = appConfig.uart.uartPort;
+    uartConfig.rxPin = appConfig.uart.rxPin;
+    uartConfig.txPin = appConfig.uart.txPin;
+    uartConfig.baudRate = appConfig.uart.baudRate;
+    uartConfig.dataBits = appConfig.uart.dataBits;
+    uartConfig.parity = appConfig.uart.parity;
+    uartConfig.stopBits = appConfig.uart.stopBits;
+    uartConfig.rxBufSize = appConfig.uart.rxBufSize;
+    uartConfig.ringBufSize = appConfig.uart.ringBufSize;
+    uartConfig.timeoutMs = appConfig.uart.timeoutMs;
+
+    ret = uartCapture.init(&uartConfig);
+    if (ret != ESP_OK) {
+      ESP_LOGE(TAG, "UART transport init failed!");
+      return;
+    }
+
+    uartCapture.setBurstCallback(onBurstEnd);
+    g_dataSource = &uartCapture;
+    ESP_LOGI(TAG, "UART transport initialized: UART%d @ %lu bps, RX=%d, data=%d, parity=%d, stop=%d",
+             uartConfig.uartPort, uartConfig.baudRate, uartConfig.rxPin,
+             uartConfig.dataBits, uartConfig.parity, uartConfig.stopBits);
+  } else if (appConfig.transportType == Transport::Type::PARALLEL_PORT) {
+    // Initialize Parallel Port transport
+    static ParallelPortCapture parallelCapture;
+    ParallelPortCapture::Config parallelConfig;
+    
+    // Copy data pins from config
+    for (int i = 0; i < 8; i++) {
+      parallelConfig.dataPins[i] = appConfig.parallelPort.dataPins[i];
+    }
+    
+    parallelConfig.strobePin = appConfig.parallelPort.strobePin;
+    parallelConfig.strobeActiveHigh = appConfig.parallelPort.strobeActiveHigh;
+    parallelConfig.ringBufSize = appConfig.parallelPort.ringBufSize;
+    parallelConfig.timeoutMs = appConfig.parallelPort.timeoutMs;
+
+    ret = parallelCapture.init(&parallelConfig);
+    if (ret != ESP_OK) {
+      ESP_LOGE(TAG, "Parallel Port transport init failed!");
+      return;
+    }
+
+    parallelCapture.setBurstCallback(onBurstEnd);
+    g_dataSource = &parallelCapture;
+    ESP_LOGI(TAG, "Parallel Port transport initialized: Data pins [%d,%d,%d,%d,%d,%d,%d,%d], Strobe=%d",
+             parallelConfig.dataPins[0], parallelConfig.dataPins[1], parallelConfig.dataPins[2], 
+             parallelConfig.dataPins[3], parallelConfig.dataPins[4], parallelConfig.dataPins[5],
+             parallelConfig.dataPins[6], parallelConfig.dataPins[7], parallelConfig.strobePin);
+  }
 
   // Initialize DataPipeline
   ESP_LOGI(TAG, "Initializing DataPipeline...");
@@ -203,7 +301,7 @@ extern "C" void app_main(void) {
   pipeConfig.flushTimeoutMs = 500;
   pipeConfig.autoStart = true;
 
-  ret = DataPipeline::init(pipeConfig);
+  ret = DataPipeline::init(pipeConfig, g_dataSource);
   if (ret != ESP_OK) {
     ESP_LOGE(TAG, "DataPipeline init failed!");
     return;
@@ -214,8 +312,27 @@ extern "C" void app_main(void) {
 
   ESP_LOGI(TAG, "======================================");
   ESP_LOGI(TAG, "  DataLogger Ready!");
-  ESP_LOGI(TAG, "  UART2 RX: GPIO16 @ 115200 bps");
-  ESP_LOGI(TAG, "  Commands: format, stats, help");
+  if (appConfig.transportType == Transport::Type::UART) {
+    ESP_LOGI(TAG, "  Transport: UART%d RX: GPIO%d @ %lu bps",
+             appConfig.uart.uartPort,
+             appConfig.uart.rxPin,
+             appConfig.uart.baudRate);
+  } else if (appConfig.transportType == Transport::Type::PARALLEL_PORT) {
+    ESP_LOGI(TAG, "  Transport: Parallel Port (8-bit + Strobe)");
+    ESP_LOGI(TAG, "    Data pins: [%d,%d,%d,%d,%d,%d,%d,%d]",
+             appConfig.parallelPort.dataPins[0],
+             appConfig.parallelPort.dataPins[1],
+             appConfig.parallelPort.dataPins[2],
+             appConfig.parallelPort.dataPins[3],
+             appConfig.parallelPort.dataPins[4],
+             appConfig.parallelPort.dataPins[5],
+             appConfig.parallelPort.dataPins[6],
+             appConfig.parallelPort.dataPins[7]);
+    ESP_LOGI(TAG, "    Strobe pin: GPIO%d (%s edge)",
+             appConfig.parallelPort.strobePin,
+             appConfig.parallelPort.strobeActiveHigh ? "rising" : "falling");
+  }
+  ESP_LOGI(TAG, "  Commands: format, stats, config, transport, help");
   ESP_LOGI(TAG, "======================================");
   ESP_LOGI(TAG, "Free heap after init: %lu bytes", esp_get_free_heap_size());
   printf("READY\n");

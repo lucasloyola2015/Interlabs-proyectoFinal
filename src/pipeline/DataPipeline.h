@@ -4,14 +4,17 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 
+// Forward declarations
+class IDataSource;
+
 /**
- * @brief DataPipeline - Coordinates UART capture to Flash storage
+ * @brief DataPipeline - Coordinates data capture to Flash storage
  *
- * Runs a Flash Writer task on Core 1 that consumes data from the
- * UartCapture ring buffer and writes it to FlashRing.
+ * Runs a Flash Writer task on Core 1 that consumes data from any
+ * IDataSource transport (UART, Parallel Port, etc.) and writes it to FlashRing.
  *
  * This achieves dual-core separation:
- * - Core 0: UART ISR and capture task
+ * - Core 0: Transport ISR and capture task
  * - Core 1: Flash write operations
  */
 
@@ -27,12 +30,13 @@ struct Config {
 /**
  * @brief Initialize the data pipeline
  *
- * Must be called after FlashRing::init() and UartCapture::init()
+ * Must be called after FlashRing::init() and transport source init()
  *
  * @param config Configuration parameters
+ * @param dataSource Pointer to initialized IDataSource transport
  * @return ESP_OK on success
  */
-esp_err_t init(const Config &config);
+esp_err_t init(const Config &config, IDataSource* dataSource);
 
 /**
  * @brief Start the pipeline (if autoStart was false)

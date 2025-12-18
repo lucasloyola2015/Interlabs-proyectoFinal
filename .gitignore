@@ -1,0 +1,40 @@
+# PlatformIO
+.pio/
+.vscode/
+.idea/
+
+# Build artifacts
+*.o
+*.elf
+*.bin
+*.map
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+*.log
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# IDE
+*.swp
+*.swo
+*~
+
+# ESP-IDF
+sdkconfig
+sdkconfig.old
+build/
+
+# Backup files
+*.zip
+*.rar
+backup_*

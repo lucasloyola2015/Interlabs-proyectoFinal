@@ -1,0 +1,23 @@
+# ESP-IDF SDK Configuration Defaults
+# DataLogger optimizations
+
+# Increase UART buffer
+CONFIG_UART_ISR_IN_IRAM=y
+
+# Wear leveling configuration
+CONFIG_WL_SECTOR_SIZE_4096=y
+
+# FreeRTOS optimizations for dual-core
+CONFIG_FREERTOS_UNICORE=n
+CONFIG_FREERTOS_HZ=1000
+
+# Logging level (set to INFO for production, DEBUG for development)
+CONFIG_LOG_DEFAULT_LEVEL_INFO=y
+CONFIG_LOG_MAXIMUM_LEVEL_DEBUG=y
+
+# Disable timestamp in logs
+# CONFIG_LOG_TIMESTAMP_SOURCE_RTOS is not set
+# CONFIG_LOG_TIMESTAMP_SOURCE_SYSTEM is not set
+
+# Enable NVS
+CONFIG_NVS_ENCRYPTION=n

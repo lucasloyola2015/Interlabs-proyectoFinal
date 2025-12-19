@@ -152,6 +152,38 @@ public:
   esp_err_t sendJson(const char* topic, const char* json);
 
   /**
+   * @brief Send command response with automatic device info decoration
+   * Automatically includes deviceId and deviceName in the response JSON
+   * @param topic Topic to publish response to
+   * @param requestId Optional request ID from the command (for correlation)
+   * @param command Command name that was executed
+   * @param status Status string ("ok" or "error")
+   * @param message Response message
+   * @param data Optional response data (can be JSON string or plain string)
+   * @param error Optional error message (if status is "error")
+   * @return ESP_OK on success
+   */
+  esp_err_t sendCommandResponse(const char *topic, const char *requestId, 
+                                const char *command, const char *status,
+                                const char *message, const char *data = nullptr,
+                                const char *error = nullptr);
+
+  /**
+   * @brief Subscribe to an MQTT topic
+   * @param topic Topic to subscribe to
+   * @param qos Quality of Service level (0, 1, or 2). If -1, uses configured QoS
+   * @return ESP_OK on success
+   */
+  esp_err_t subscribe(const char *topic, int qos = -1);
+
+  /**
+   * @brief Unsubscribe from an MQTT topic
+   * @param topic Topic to unsubscribe from
+   * @return ESP_OK on success
+   */
+  esp_err_t unsubscribe(const char *topic);
+
+  /**
    * @brief Set callback for received messages
    * @param callback Function to call when a message is received
    */

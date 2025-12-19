@@ -24,6 +24,7 @@ MqttClient::MqttClient()
   m_topicPub[0] = '\0';
   m_topicSub[0] = '\0';
   m_clientId[0] = '\0';
+  m_uri[0] = '\0';
 }
 
 MqttClient::~MqttClient() {
@@ -53,44 +54,56 @@ esp_err_t MqttClient::init() {
     return ESP_ERR_INVALID_ARG;
   }
 
-  // Construir URI del broker (sin credenciales en la URI)
-  char uri[128];
-  snprintf(uri, sizeof(uri), "mqtt://%s:%d", m_host, m_port);
+  // Construir URI del broker (sin credenciales en la URI) - use member buffer
+  snprintf(m_uri, sizeof(m_uri), "mqtt://%s:%d", m_host, m_port);
 
   ESP_LOGI(TAG, "Inicializando cliente MQTT: %s (puerto %d)", m_host, m_port);
 
-  // Configurar cliente MQTT
-  esp_mqtt_client_config_t mqtt_cfg = {};
-  mqtt_cfg.broker.address.uri = uri;
-  mqtt_cfg.session.keepalive = 60;
-  mqtt_cfg.session.disable_clean_session = false;
-  mqtt_cfg.session.last_will.topic = nullptr; // Sin Last Will por ahora
+  // Configurar ID del cliente si no está disponible
+  if (strlen(m_clientId) == 0) {
+    // Generar ID único basado en MAC - use heap to avoid stack overflow
+    ConfigManager::FullConfig *config = (ConfigManager::FullConfig *)malloc(sizeof(ConfigManager::FullConfig));
+    if (config) {
+      if (ConfigManager::getConfig(config) == ESP_OK) {
+        if (strlen(config->device.id) > 0) {
+          snprintf(m_clientId, sizeof(m_clientId), "datalogger_%s",
+                   config->device.id);
+        }
+      }
+      free(config);
+    }
+  }
+
+  // Configurar cliente MQTT - use heap to avoid stack overflow
+  esp_mqtt_client_config_t *mqtt_cfg = (esp_mqtt_client_config_t *)calloc(1, sizeof(esp_mqtt_client_config_t));
+  if (!mqtt_cfg) {
+    ESP_LOGE(TAG, "Failed to allocate memory for MQTT config");
+    return ESP_ERR_NO_MEM;
+  }
+
+  mqtt_cfg->broker.address.uri = m_uri;
+  mqtt_cfg->session.keepalive = 60;
+  mqtt_cfg->session.disable_clean_session = false;
+  mqtt_cfg->session.last_will.topic = nullptr; // Sin Last Will por ahora
 
   // Configurar autenticación si está habilitada
   if (m_useAuth && strlen(m_username) > 0) {
-    mqtt_cfg.credentials.username = m_username;
+    mqtt_cfg->credentials.username = m_username;
     if (strlen(m_password) > 0) {
-      mqtt_cfg.credentials.authentication.password = m_password;
+      mqtt_cfg->credentials.authentication.password = m_password;
     }
   }
 
   // Configurar ID del cliente si está disponible
   if (strlen(m_clientId) > 0) {
-    mqtt_cfg.credentials.client_id = m_clientId;
-  } else {
-    // Generar ID único basado en MAC
-    ConfigManager::FullConfig config;
-    if (ConfigManager::getConfig(&config) == ESP_OK) {
-      if (strlen(config.device.id) > 0) {
-        snprintf(m_clientId, sizeof(m_clientId), "datalogger_%s",
-                 config.device.id);
-        mqtt_cfg.credentials.client_id = m_clientId;
-      }
-    }
+    mqtt_cfg->credentials.client_id = m_clientId;
   }
 
   // Crear cliente MQTT
-  m_client = esp_mqtt_client_init(&mqtt_cfg);
+  m_client = esp_mqtt_client_init(mqtt_cfg);
+  
+  // Free config structure - client makes its own copy
+  free(mqtt_cfg);
   if (!m_client) {
     ESP_LOGE(TAG, "Error al crear cliente MQTT");
     return ESP_FAIL;
@@ -105,25 +118,32 @@ esp_err_t MqttClient::init() {
 }
 
 esp_err_t MqttClient::reloadConfig() {
-  ConfigManager::FullConfig config;
-  esp_err_t ret = ConfigManager::getConfig(&config);
+  // Use heap to avoid stack overflow - FullConfig is ~700 bytes
+  ConfigManager::FullConfig *config = (ConfigManager::FullConfig *)malloc(sizeof(ConfigManager::FullConfig));
+  if (!config) {
+    ESP_LOGE(TAG, "Failed to allocate memory for config");
+    return ESP_ERR_NO_MEM;
+  }
+  
+  esp_err_t ret = ConfigManager::getConfig(config);
   if (ret != ESP_OK) {
     ESP_LOGE(TAG, "Error al cargar configuración: %s", esp_err_to_name(ret));
+    free(config);
     return ret;
   }
 
   // Copiar configuración MQTT
-  strncpy(m_host, config.mqtt.host, sizeof(m_host) - 1);
+  strncpy(m_host, config->mqtt.host, sizeof(m_host) - 1);
   m_host[sizeof(m_host) - 1] = '\0';
-  m_port = config.mqtt.port;
-  m_qos = config.mqtt.qos;
+  m_port = config->mqtt.port;
+  m_qos = config->mqtt.qos;
   if (m_qos > 2) m_qos = 1; // Validar QoS (0, 1 o 2)
-  m_useAuth = config.mqtt.useAuth;
+  m_useAuth = config->mqtt.useAuth;
 
   if (m_useAuth) {
-    strncpy(m_username, config.mqtt.username, sizeof(m_username) - 1);
+    strncpy(m_username, config->mqtt.username, sizeof(m_username) - 1);
     m_username[sizeof(m_username) - 1] = '\0';
-    strncpy(m_password, config.mqtt.password, sizeof(m_password) - 1);
+    strncpy(m_password, config->mqtt.password, sizeof(m_password) - 1);
     m_password[sizeof(m_password) - 1] = '\0';
   } else {
     m_username[0] = '\0';
@@ -132,21 +152,22 @@ esp_err_t MqttClient::reloadConfig() {
 
   // Copy topics ensuring null termination
   memset(m_topicPub, 0, sizeof(m_topicPub));
-  strncpy(m_topicPub, config.mqtt.topicPub, sizeof(m_topicPub) - 1);
+  strncpy(m_topicPub, config->mqtt.topicPub, sizeof(m_topicPub) - 1);
   m_topicPub[sizeof(m_topicPub) - 1] = '\0';
   
   memset(m_topicSub, 0, sizeof(m_topicSub));
-  strncpy(m_topicSub, config.mqtt.topicSub, sizeof(m_topicSub) - 1);
+  strncpy(m_topicSub, config->mqtt.topicSub, sizeof(m_topicSub) - 1);
   m_topicSub[sizeof(m_topicSub) - 1] = '\0';
 
   // Generar client ID si no existe
-  if (strlen(m_clientId) == 0 && strlen(config.device.id) > 0) {
-    snprintf(m_clientId, sizeof(m_clientId), "datalogger_%s", config.device.id);
+  if (strlen(m_clientId) == 0 && strlen(config->device.id) > 0) {
+    snprintf(m_clientId, sizeof(m_clientId), "datalogger_%s", config->device.id);
   }
 
   ESP_LOGI(TAG, "Configuracion MQTT cargada: %s:%d, QoS=%d, Pub=[%s], Sub=[%s]",
            m_host, m_port, m_qos, m_topicPub, m_topicSub);
 
+  free(config);
   return ESP_OK;
 }
 

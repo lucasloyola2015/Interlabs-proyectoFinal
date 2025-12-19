@@ -1,10 +1,10 @@
 #include "WebServer.h"
 #include "../config/ConfigManager.h"
-#include "../mqtt/MqttClient.h"
 #include "../mqtt/MqttManager.h"
 #include "../pipeline/DataPipeline.h"
 #include "../storage/FlashRing.h"
 #include "../transport/TransportTypes.h"
+#include "../utils/CommandSystem.h"
 #include "esp_http_server.h"
 #include "esp_log.h"
 #include "esp_system.h"
@@ -44,6 +44,13 @@ static esp_err_t apiSystemRebootHandler(httpd_req_t *req);
 static esp_err_t apiGetFullConfigHandler(httpd_req_t *req);
 static esp_err_t apiSaveFullConfigHandler(httpd_req_t *req);
 static esp_err_t apiTestMqttHandler(httpd_req_t *req);
+
+// Helper functions for CommandSystem integration
+static void sendWebCommandResponse(httpd_req_t *req,
+                                    const CommandSystem::CommandResult *result);
+static void webResponseCallback(CommandSystem::Medium medium,
+                                const CommandSystem::CommandResult *result,
+                                void *userCtx);
 
 esp_err_t init(INetworkInterface *ethInterface,
                INetworkInterface *wifiInterface, uint16_t port) {
@@ -94,6 +101,11 @@ esp_err_t start() {
   for (const auto &handler : handlers) {
     registerUri(handler);
   }
+
+  // Register WEB response callback for CommandSystem
+  // Note: Individual handlers will pass their httpd_req_t as userCtx
+  CommandSystem::registerResponseCallback(
+      CommandSystem::Medium::WEB, webResponseCallback, nullptr);
 
   s_running = true;
   ESP_LOGI(TAG, "Web server started on port %d", s_port);
@@ -991,46 +1003,11 @@ static esp_err_t apiStatusHandler(httpd_req_t *req) {
 }
 
 static esp_err_t apiDataLoggerStatsHandler(httpd_req_t *req) {
-  if (!s_dataloggerCallbacks.getFlashStats)
-    return ESP_FAIL;
-  struct FlashStats {
-    size_t partitionSize, usedBytes, freeBytes;
-    uint32_t wrapCount, totalWritten;
-  } fs = {};
-  s_dataloggerCallbacks.getFlashStats(&fs);
-  struct TransportStats {
-    uint64_t totalBytesReceived;
-    uint32_t burstCount, overflowCount;
-  } ts = {};
-  bool hasTr = s_dataloggerCallbacks.getTransportStats &&
-               s_dataloggerCallbacks.getTransportStats(&ts) == ESP_OK;
-  struct PipelineStats {
-    size_t bytesWrittenToFlash, bytesDropped;
-    uint32_t writeOperations, flushOperations;
-    bool running;
-  } ps = {};
-  (void)s_dataloggerCallbacks.getPipelineStats; // Silence unused warning
-  if (s_dataloggerCallbacks.getPipelineStats)
-    s_dataloggerCallbacks.getPipelineStats(&ps);
-  const char *trType = (hasTr && s_dataloggerCallbacks.getTransportTypeName)
-                           ? s_dataloggerCallbacks.getTransportTypeName()
-                           : "unknown";
-  char resp[512];
-  snprintf(resp, sizeof(resp),
-           "{\"flash\":{\"partitionSize\":%u,\"usedBytes\":%u,\"freeBytes\":%u,"
-           "\"usedPercent\":%.1f,\"wrapCount\":%lu,\"totalWritten\":%lu},"
-           "\"transport\":{\"totalBytes\":%llu,\"bursts\":%lu,\"overflows\":%"
-           "lu,\"type\":\"%s\"},"
-           "\"pipeline\":{\"bytesWritten\":%u,\"bytesDropped\":%u,\"writeOps\":"
-           "%lu,\"running\":%s}}",
-           fs.partitionSize, fs.usedBytes, fs.freeBytes,
-           fs.partitionSize > 0 ? (100.0f * fs.usedBytes / fs.partitionSize)
-                                : 0.0f,
-           fs.wrapCount, fs.totalWritten, ts.totalBytesReceived, ts.burstCount,
-           ts.overflowCount, trType, ps.bytesWrittenToFlash, ps.bytesDropped,
-           ps.writeOperations, ps.running ? "true" : "false");
-  httpd_resp_set_type(req, "application/json");
-  httpd_resp_send(req, resp, strlen(resp));
+  // Execute stats command through CommandSystem
+  CommandSystem::CommandResult result = CommandSystem::executeCommand(
+      CommandSystem::Medium::WEB, "stats");
+  
+  sendWebCommandResponse(req, &result);
   return ESP_OK;
 }
 
@@ -1431,19 +1408,72 @@ static esp_err_t apiUserConfigHandler(httpd_req_t *req) {
   return ESP_OK;
 }
 
+static void sendWebCommandResponse(httpd_req_t *req,
+                                    const CommandSystem::CommandResult *result) {
+  if (!req || !result) {
+    return;
+  }
+
+  // Format response as JSON
+  char response[1024];
+  if (result->status == ESP_OK) {
+    if (result->data && result->dataLen > 0) {
+      // Special handling for stats command - return JSON directly for compatibility
+      if (strcmp(result->message, "STATS_DATA") == 0 && result->data[0] == '{') {
+        // Return the JSON data directly (web expects direct JSON, not wrapped)
+        httpd_resp_set_type(req, "application/json");
+        httpd_resp_send(req, result->data, result->dataLen);
+        return;
+      }
+      // If data is already JSON (like config), wrap it
+      if (result->data[0] == '{') {
+        snprintf(response, sizeof(response), "{\"success\":true,\"message\":\"%s\",\"data\":%s}",
+                 result->message, result->data);
+      } else {
+        snprintf(response, sizeof(response), "{\"success\":true,\"message\":\"%s\",\"data\":\"%s\"}",
+                 result->message, result->data);
+      }
+    } else {
+      snprintf(response, sizeof(response), "{\"success\":true,\"message\":\"%s\"}",
+               result->message);
+    }
+  } else {
+    snprintf(response, sizeof(response),
+             "{\"success\":false,\"message\":\"%s\",\"error\":\"%s\"}",
+             result->message, result->data ? result->data : esp_err_to_name(result->status));
+  }
+  
+  httpd_resp_set_type(req, "application/json");
+  httpd_resp_send(req, response, HTTPD_RESP_USE_STRLEN);
+}
+
+static void webResponseCallback(CommandSystem::Medium medium,
+                                const CommandSystem::CommandResult *result,
+                                void *userCtx) {
+  // This callback is registered but may not be used for all commands
+  // Individual handlers will use sendWebCommandResponse directly
+  (void)medium;
+  (void)result;
+  (void)userCtx;
+}
+
 static esp_err_t apiDataLoggerFormatHandler(httpd_req_t *req) {
-  if (s_dataloggerCallbacks.formatFlash &&
-      s_dataloggerCallbacks.formatFlash() == ESP_OK)
-    httpd_resp_send(req, "{\"success\":true}", -1);
-  else
-    httpd_resp_send(req, "{\"success\":false}", -1);
+  // Execute format command through CommandSystem
+  CommandSystem::CommandResult result = CommandSystem::executeCommand(
+      CommandSystem::Medium::WEB, "format");
+  
+  sendWebCommandResponse(req, &result);
   return ESP_OK;
 }
 
 static esp_err_t apiSystemRebootHandler(httpd_req_t *req) {
-  httpd_resp_send(req, "{\"success\":true}", -1);
-  vTaskDelay(pdMS_TO_TICKS(1000));
-  esp_restart();
+  // Execute reset command through CommandSystem
+  // Note: reset command sends response to DEBUG before rebooting
+  CommandSystem::CommandResult result = CommandSystem::executeCommand(
+      CommandSystem::Medium::WEB, "reset");
+  
+  // Send response through web (command will reboot after)
+  sendWebCommandResponse(req, &result);
   return ESP_OK;
 }
 

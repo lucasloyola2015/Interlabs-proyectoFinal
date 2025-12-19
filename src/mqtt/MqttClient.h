@@ -190,6 +190,7 @@ private:
   char m_topicPub[64];                    ///< Topic para publicar
   char m_topicSub[64];                    ///< Topic para suscribirse
   char m_clientId[32];                    ///< ID del cliente
+  char m_uri[128];                        ///< URI completa del broker (persistente para MQTT config)
 
   MessageCallback m_messageCallback;      ///< Callback para mensajes
   ConnectionCallback m_connectionCallback; ///< Callback para conexión

@@ -12,6 +12,7 @@ idf_component_register(
         "mqtt/MqttClient.cpp"
         "mqtt/MqttManager.cpp"
         "utils/CommandSystem.cpp"
+        "utils/MqttCommandHandler.cpp"
         "utils/ButtonMonitor.cpp"
         "utils/LedManager.cpp"
     INCLUDE_DIRS 

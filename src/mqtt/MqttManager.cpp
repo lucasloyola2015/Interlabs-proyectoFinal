@@ -180,6 +180,161 @@ esp_err_t MqttManager::sendJson(const char* topic, const char* json) {
   return m_client.publish(topic, (const uint8_t*)json, len);
 }
 
+esp_err_t MqttManager::sendCommandResponse(const char *topic, const char *requestId,
+                                           const char *command, const char *status,
+                                           const char *message, const char *data,
+                                           const char *error) {
+  if (!topic || !command || !status || !message) {
+    return ESP_ERR_INVALID_ARG;
+  }
+
+  if (!isConnected()) {
+    ESP_LOGW(TAG, "MQTT not connected, cannot send command response");
+    return ESP_ERR_INVALID_STATE;
+  }
+
+  // Format command response JSON with device info
+  size_t pos = 0;
+
+  // Start JSON object
+  pos += snprintf(m_jsonBuffer + pos, sizeof(m_jsonBuffer) - pos, "{");
+
+  // Always include device info
+  bool needsComma = false;
+  if (strlen(m_deviceId) > 0) {
+    pos += snprintf(m_jsonBuffer + pos, sizeof(m_jsonBuffer) - pos, "\"deviceId\":\"%s\"", m_deviceId);
+    needsComma = true;
+  }
+  if (strlen(m_deviceName) > 0) {
+    if (needsComma) pos += snprintf(m_jsonBuffer + pos, sizeof(m_jsonBuffer) - pos, ",");
+    pos += snprintf(m_jsonBuffer + pos, sizeof(m_jsonBuffer) - pos, "\"deviceName\":\"%s\"", m_deviceName);
+    needsComma = true;
+  }
+
+  // Add type
+  if (needsComma) pos += snprintf(m_jsonBuffer + pos, sizeof(m_jsonBuffer) - pos, ",");
+  pos += snprintf(m_jsonBuffer + pos, sizeof(m_jsonBuffer) - pos, "\"type\":\"command_response\"");
+  needsComma = true;
+
+  // Add request ID if provided
+  if (requestId && strlen(requestId) > 0) {
+    if (needsComma) pos += snprintf(m_jsonBuffer + pos, sizeof(m_jsonBuffer) - pos, ",");
+    pos += snprintf(m_jsonBuffer + pos, sizeof(m_jsonBuffer) - pos, "\"id\":\"%s\"", requestId);
+    needsComma = true;
+  }
+
+  // Add command
+  if (needsComma) pos += snprintf(m_jsonBuffer + pos, sizeof(m_jsonBuffer) - pos, ",");
+  pos += snprintf(m_jsonBuffer + pos, sizeof(m_jsonBuffer) - pos, "\"command\":\"%s\"", command);
+  needsComma = true;
+
+  // Add status
+  if (needsComma) pos += snprintf(m_jsonBuffer + pos, sizeof(m_jsonBuffer) - pos, ",");
+  pos += snprintf(m_jsonBuffer + pos, sizeof(m_jsonBuffer) - pos, "\"status\":\"%s\"", status);
+  needsComma = true;
+
+  // Add message
+  if (needsComma) pos += snprintf(m_jsonBuffer + pos, sizeof(m_jsonBuffer) - pos, ",");
+  // Escape message string
+  pos += snprintf(m_jsonBuffer + pos, sizeof(m_jsonBuffer) - pos, "\"message\":\"");
+  for (const char *p = message; *p && pos < sizeof(m_jsonBuffer) - 3; p++) {
+    if (*p == '"' || *p == '\\') {
+      pos += snprintf(m_jsonBuffer + pos, sizeof(m_jsonBuffer) - pos, "\\%c", *p);
+    } else if (*p == '\n') {
+      pos += snprintf(m_jsonBuffer + pos, sizeof(m_jsonBuffer) - pos, "\\n");
+    } else {
+      m_jsonBuffer[pos++] = *p;
+    }
+  }
+  pos += snprintf(m_jsonBuffer + pos, sizeof(m_jsonBuffer) - pos, "\"");
+  needsComma = true;
+
+  // Add data if provided
+  if (data && strlen(data) > 0) {
+    if (needsComma) pos += snprintf(m_jsonBuffer + pos, sizeof(m_jsonBuffer) - pos, ",");
+    // Try to parse as JSON, if it's valid JSON, embed it as object
+    if (data[0] == '{') {
+      // It's JSON, embed directly
+      pos += snprintf(m_jsonBuffer + pos, sizeof(m_jsonBuffer) - pos, "\"data\":");
+      // Simple copy - assume valid JSON
+      for (const char *p = data; *p && pos < sizeof(m_jsonBuffer) - 2; p++) {
+        m_jsonBuffer[pos++] = *p;
+      }
+      needsComma = true;
+    } else {
+      // It's a string, escape it
+      pos += snprintf(m_jsonBuffer + pos, sizeof(m_jsonBuffer) - pos, "\"data\":\"");
+      for (const char *p = data; *p && pos < sizeof(m_jsonBuffer) - 3; p++) {
+        if (*p == '"' || *p == '\\') {
+          pos += snprintf(m_jsonBuffer + pos, sizeof(m_jsonBuffer) - pos, "\\%c", *p);
+        } else if (*p == '\n') {
+          pos += snprintf(m_jsonBuffer + pos, sizeof(m_jsonBuffer) - pos, "\\n");
+        } else {
+          m_jsonBuffer[pos++] = *p;
+        }
+      }
+      pos += snprintf(m_jsonBuffer + pos, sizeof(m_jsonBuffer) - pos, "\"");
+      needsComma = true;
+    }
+  }
+
+  // Add error if provided
+  if (error && strlen(error) > 0) {
+    if (needsComma) pos += snprintf(m_jsonBuffer + pos, sizeof(m_jsonBuffer) - pos, ",");
+    pos += snprintf(m_jsonBuffer + pos, sizeof(m_jsonBuffer) - pos, "\"error\":\"");
+    for (const char *p = error; *p && pos < sizeof(m_jsonBuffer) - 3; p++) {
+      if (*p == '"' || *p == '\\') {
+        pos += snprintf(m_jsonBuffer + pos, sizeof(m_jsonBuffer) - pos, "\\%c", *p);
+      } else if (*p == '\n') {
+        pos += snprintf(m_jsonBuffer + pos, sizeof(m_jsonBuffer) - pos, "\\n");
+      } else {
+        m_jsonBuffer[pos++] = *p;
+      }
+    }
+    pos += snprintf(m_jsonBuffer + pos, sizeof(m_jsonBuffer) - pos, "\"");
+  }
+
+  // Close JSON
+  pos += snprintf(m_jsonBuffer + pos, sizeof(m_jsonBuffer) - pos, "}");
+
+  // Ensure null termination
+  if (pos >= sizeof(m_jsonBuffer)) {
+    pos = sizeof(m_jsonBuffer) - 1;
+  }
+  m_jsonBuffer[pos] = '\0';
+
+  // Publish via MqttClient
+  return m_client.publish(topic, (const uint8_t*)m_jsonBuffer, pos);
+}
+
+esp_err_t MqttManager::subscribe(const char *topic, int qos) {
+  if (!topic) {
+    return ESP_ERR_INVALID_ARG;
+  }
+
+  if (!isConnected()) {
+    ESP_LOGW(TAG, "MQTT not connected, cannot subscribe");
+    return ESP_ERR_INVALID_STATE;
+  }
+
+  // Use configured QoS if not specified
+  int actualQos = (qos >= 0) ? qos : -1;
+  return m_client.subscribe(topic, actualQos);
+}
+
+esp_err_t MqttManager::unsubscribe(const char *topic) {
+  if (!topic) {
+    return ESP_ERR_INVALID_ARG;
+  }
+
+  if (!isConnected()) {
+    ESP_LOGW(TAG, "MQTT not connected, cannot unsubscribe");
+    return ESP_ERR_INVALID_STATE;
+  }
+
+  return m_client.unsubscribe(topic);
+}
+
 void MqttManager::setMessageCallback(MqttClient::MessageCallback callback) {
   m_client.setMessageCallback(callback);
 }

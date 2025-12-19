@@ -36,12 +36,15 @@
 #include "utils/ButtonMonitor.h"
 #include "utils/CommandSystem.h"
 #include "utils/LedManager.h"
+#include "mqtt/MqttManager.h"
+#include "utils/MqttCommandHandler.h"
 
 static const char *TAG = "DataLogger";
 
 // Global instances
 static IDataSource *g_dataSource = nullptr;
 static INetworkInterface *g_networkInterface = nullptr;
+static MqttManager g_mqttManager;  // Global to avoid stack overflow
 
 // Burst callback - called when a data burst ends
 static void onBurstEnd(bool ended, size_t bytes) {
@@ -248,7 +251,30 @@ extern "C" void app_main(void) {
   // 7. Start UI/CLI Interfaces
   CommandSystem::initialize(g_dataSource);
 
-  // 8. Start Button Monitor (for SAFE MODE trigger)
+  // 8. Initialize MQTT (if network is available - MQTT can work for both COORDINADOR and ENDPOINT)
+  if (g_networkInterface) {
+    if (g_mqttManager.init() == ESP_OK) {
+      ESP_LOGI(TAG, "MQTT Manager initialized");
+      
+      // Initialize MQTT command handler (pass MqttManager, not MqttClient)
+      if (MqttCommandHandler::init(&g_mqttManager) == ESP_OK) {
+        ESP_LOGI(TAG, "MQTT Command Handler initialized");
+      } else {
+        ESP_LOGW(TAG, "MQTT Command Handler initialization failed");
+      }
+      
+      // Try to connect MQTT
+      if (g_mqttManager.connect() == ESP_OK) {
+        ESP_LOGI(TAG, "MQTT connecting...");
+      } else {
+        ESP_LOGW(TAG, "MQTT connection failed");
+      }
+    } else {
+      ESP_LOGW(TAG, "MQTT Manager initialization failed");
+    }
+  }
+
+  // 9. Start Button Monitor (for SAFE MODE trigger)
   ESP_ERROR_CHECK(ButtonMonitor::init());
 
   ESP_LOGI(TAG, "System Ready. Free heap: %lu bytes", esp_get_free_heap_size());

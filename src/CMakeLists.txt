@@ -6,6 +6,12 @@ idf_component_register(
         "storage/FlashRing.cpp"
         "transport/uart/UartCapture.cpp"
         "transport/parallel/ParallelPortCapture.cpp"
+        "network/ethernet/EthernetW5500.cpp"
+        "network/wifi/WifiInterface.cpp"
+        "webserver/WebServer.cpp"
+        "utils/CommandSystem.cpp"
+        "utils/ButtonMonitor.cpp"
+        "utils/LedManager.cpp"
     INCLUDE_DIRS 
         "."
         "pipeline"
@@ -13,6 +19,12 @@ idf_component_register(
         "transport"
         "transport/uart"
         "transport/parallel"
+        "network"
+        "network/ethernet"
+        "network/wifi"
+        "webserver"
         "config"
         "utils"
+    REQUIRES
+        w5500
 )

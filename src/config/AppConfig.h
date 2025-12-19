@@ -5,30 +5,40 @@
 
 /**
  * @brief Application configuration
- * 
- * This file provides compatibility layer for AppConfig namespace.
- * Actual configuration is now managed by ConfigManager and stored in NVS.
- * 
- * @deprecated Use ConfigManager directly for runtime configuration.
- * This namespace is kept for backward compatibility.
+ *
+ * @deprecated This file is deprecated. Use ConfigManager::FullConfig directly.
+ * Kept only for minimal backward compatibility.
  */
 
 namespace AppConfig {
 
-/// Get current transport type from ConfigManager
+// Legacy compatibility - returns default values
+// TODO: Remove this file and update all references to use
+// ConfigManager::FullConfig
+
 inline Transport::Type getTransportType() {
-    return ConfigManager::getTransportType();
+  // Return default since transport is not in FullConfig yet
+  return Transport::Type::UART;
 }
 
-/// Get UART configuration from ConfigManager
-inline esp_err_t getUartConfig(ConfigManager::UartConfig* config) {
-    return ConfigManager::getUartConfig(config);
+inline esp_err_t getUartConfig(ConfigManager::UartConfig *config) {
+  // Return default UART config
+  *config = ConfigManager::UartConfig();
+  return ESP_OK;
 }
 
-/// Get Parallel Port configuration from ConfigManager
-inline esp_err_t getParallelPortConfig(ConfigManager::ParallelPortConfig* config) {
-    return ConfigManager::getParallelPortConfig(config);
+struct ParallelPortConfig {
+  int dataPins[8] = {2, 4, 5, 18, 19, 21, 22, 23};
+  int strobePin = 0;
+  bool strobeActiveHigh = true;
+  size_t ringBufSize = 64 * 1024;
+  uint32_t timeoutMs = 100;
+};
+
+inline esp_err_t getParallelPortConfig(ParallelPortConfig *config) {
+  // Return default parallel port config
+  *config = ParallelPortConfig();
+  return ESP_OK;
 }
 
 } // namespace AppConfig
-

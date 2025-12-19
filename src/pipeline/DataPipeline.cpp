@@ -1,6 +1,7 @@
 #include "DataPipeline.h"
 #include "../storage/FlashRing.h"
 #include "../transport/IDataSource.h"
+#include "../utils/LedManager.h"
 #include "esp_log.h"
 #include "freertos/semphr.h"
 #include <cstring>
@@ -11,7 +12,7 @@ namespace DataPipeline {
 
 // Module state
 static Config s_config;
-static IDataSource* s_dataSource = nullptr;
+static IDataSource *s_dataSource = nullptr;
 static TaskHandle_t s_taskHandle = nullptr;
 static SemaphoreHandle_t s_flushSem = nullptr;
 static volatile bool s_running = false;
@@ -24,7 +25,7 @@ static Stats s_stats = {};
 // Task function
 static void writerTask(void *arg);
 
-esp_err_t init(const Config &config, IDataSource* dataSource) {
+esp_err_t init(const Config &config, IDataSource *dataSource) {
   if (!dataSource) {
     ESP_LOGE(TAG, "DataSource is null");
     return ESP_ERR_INVALID_ARG;
@@ -188,10 +189,13 @@ static void writerTask(void *arg) {
     size_t itemSize;
     void *item = xRingbufferReceiveUpTo(
         ringBuf, &itemSize,
-        pdMS_TO_TICKS(50), // Short timeout for responsive flush
+        pdMS_TO_TICKS(10), // Reduced latency for faster response
         s_config.writeChunkSize - pendingBytes);
 
     if (item && itemSize > 0) {
+      // Data received, signal LED activity
+      LedManager::setDataActivity(true);
+
       // Copy to write buffer
       memcpy(writeBuf + pendingBytes, item, itemSize);
       pendingBytes += itemSize;
@@ -201,9 +205,12 @@ static void writerTask(void *arg) {
 
       lastDataTime = xTaskGetTickCount();
 
-      // Page-aligned writing: write when we can complete current page + full pages
+      // ... (rest of processing)
+
+      // Page-aligned writing: write when we can complete current page + full
+      // pages
       size_t bytesToPageEnd = FlashRing::getBytesToPageEnd();
-      
+
       // If we have enough to complete current page, write it
       if (pendingBytes >= bytesToPageEnd && bytesToPageEnd > 0) {
         // Write to complete current page
@@ -216,7 +223,7 @@ static void writerTask(void *arg) {
           s_stats.bytesDropped += bytesToPageEnd;
           ESP_LOGE(TAG, "Flash write failed: %s", esp_err_to_name(ret));
         }
-        
+
         // Shift remaining data
         size_t remaining = pendingBytes - bytesToPageEnd;
         if (remaining > 0) {
@@ -224,7 +231,7 @@ static void writerTask(void *arg) {
         }
         pendingBytes = remaining;
       }
-      
+
       // Write full pages (4096 bytes each)
       while (pendingBytes >= FlashRing::PAGE_SIZE) {
         esp_err_t ret = FlashRing::write(writeBuf, FlashRing::PAGE_SIZE);
@@ -236,7 +243,7 @@ static void writerTask(void *arg) {
           s_stats.bytesDropped += FlashRing::PAGE_SIZE;
           ESP_LOGE(TAG, "Flash write failed: %s", esp_err_to_name(ret));
         }
-        
+
         // Shift remaining data
         size_t remaining = pendingBytes - FlashRing::PAGE_SIZE;
         if (remaining > 0) {
@@ -262,11 +269,8 @@ static void writerTask(void *arg) {
     }
 
     if (shouldFlush && pendingBytes > 0) {
-      // Calculate RAM buffer usage percentage
-      float usagePercent = (float)pendingBytes * 100.0f / (float)s_config.writeChunkSize;
-      ESP_LOGI(TAG, "Flushing %u bytes (used: %.1f%% RAM)", 
-               pendingBytes, usagePercent);
-
+      // calculated usage...
+      // ... (rest of flush logic)
       esp_err_t ret = FlashRing::write(writeBuf, pendingBytes);
       if (ret == ESP_OK) {
         s_stats.bytesWrittenToFlash += pendingBytes;
@@ -277,9 +281,23 @@ static void writerTask(void *arg) {
       }
       pendingBytes = 0;
 
+      // Check if ring buffer is also empty to clear LED activity
+      size_t rb_waiting = 0;
+      vRingbufferGetInfo(ringBuf, NULL, NULL, NULL, NULL, &rb_waiting);
+      if (rb_waiting == 0) {
+        LedManager::setDataActivity(false);
+      }
+
       // Also flush metadata
       FlashRing::flushMetadata();
       s_stats.flushOperations++;
+    } else if (pendingBytes == 0) {
+      // Even if no flush, check if system is idle to clear LED
+      size_t rb_waiting = 0;
+      vRingbufferGetInfo(ringBuf, NULL, NULL, NULL, NULL, &rb_waiting);
+      if (rb_waiting == 0) {
+        LedManager::setDataActivity(false);
+      }
     }
   }
 

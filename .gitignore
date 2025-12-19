@@ -17,7 +17,6 @@ __pycache__/
 .Python
 env/
 venv/
-*.log
 
 # OS
 .DS_Store
@@ -38,3 +37,14 @@ build/
 *.zip
 *.rar
 backup_*
+
+# Generated files
+compile_commands.json
+
+# Log files
+*.log
+test/logger.log
+
+# Temporary files
+temp_*.cpp
+temp_*.h

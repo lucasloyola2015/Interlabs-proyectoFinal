@@ -78,6 +78,7 @@ FullConfig getDefaultConfig() {
   // MQTT defaults
   strncpy(config.mqtt.host, "mqtt.example.com", sizeof(config.mqtt.host) - 1);
   config.mqtt.port = 1883;
+  config.mqtt.qos = 1;
   config.mqtt.useAuth = false;
   config.mqtt.username[0] = '\0';
   config.mqtt.password[0] = '\0';
@@ -304,6 +305,13 @@ bool validateConfig(FullConfig *config, bool applyDefaults) {
         config->mqtt.port = defaults.mqtt.port;
       isValid = false;
     }
+    if (config->mqtt.qos > 2) {
+      ESP_LOGW(TAG, "Invalid MQTT QoS (%d), using default: %d",
+               config->mqtt.qos, defaults.mqtt.qos);
+      if (applyDefaults)
+        config->mqtt.qos = defaults.mqtt.qos;
+      isValid = false;
+    }
     if (strlen(config->mqtt.topicPub) == 0) {
       ESP_LOGW(TAG, "Empty MQTT pub topic, using default: %s",
                defaults.mqtt.topicPub);
@@ -359,15 +367,35 @@ bool validateConfig(FullConfig *config, bool applyDefaults) {
 }
 
 uint32_t calculateCrc32(const FullConfig *config) {
-  // Calculate CRC32 of entire structure except the crc32 field itself
+  // Calculate CRC32 of entire structure except the crc32 field and device.id field
+  // device.id is generated dynamically from eFuses and never stored in NVS
   const uint8_t *data = (const uint8_t *)config;
-  size_t offset = offsetof(FullConfig, crc32);
-  size_t size1 = offset;
-  size_t size2 = sizeof(FullConfig) - offset - sizeof(uint32_t);
-
+  size_t crcOffset = offsetof(FullConfig, crc32);
+  size_t idOffset = offsetof(FullConfig, device.id);
+  size_t idSize = sizeof(config->device.id);
+  
   uint32_t crc = 0;
-  crc = esp_crc32_le(crc, data, size1);
-  crc = esp_crc32_le(crc, data + offset + sizeof(uint32_t), size2);
+  
+  // CRC of data before crc32 field
+  crc = esp_crc32_le(crc, data, crcOffset);
+  
+  // Skip crc32 field (4 bytes)
+  size_t afterCrcOffset = crcOffset + sizeof(uint32_t);
+  
+  // CRC of data between crc32 and device.id
+  if (afterCrcOffset < idOffset) {
+    crc = esp_crc32_le(crc, data + afterCrcOffset, idOffset - afterCrcOffset);
+  }
+  
+  // Skip device.id field
+  size_t afterIdOffset = idOffset + idSize;
+  size_t totalSize = sizeof(FullConfig);
+  
+  // CRC of data after device.id
+  if (afterIdOffset < totalSize) {
+    crc = esp_crc32_le(crc, data + afterIdOffset, totalSize - afterIdOffset);
+  }
+  
   return crc;
 }
 
@@ -398,13 +426,8 @@ esp_err_t init() {
     ESP_LOGI(TAG, "No valid configuration found, using defaults");
     s_config = getDefaultConfig();
 
-    // Generate device ID if empty
-    if (strlen(s_config.device.id) == 0) {
-      generateDeviceId(s_config.device.id, sizeof(s_config.device.id));
-      ESP_LOGI(TAG, "Generated Device ID: %s", s_config.device.id);
-    }
-
-    // Save defaults
+    // Device ID will be generated dynamically when needed (never stored in NVS)
+    // Save defaults (device.id will be cleared before saving)
     save(&s_config);
   }
 
@@ -455,6 +478,10 @@ esp_err_t load(FullConfig *config) {
            config->network.lan.staticIp.addr[2],
            config->network.lan.staticIp.addr[3]);
 
+  // Always generate device ID dynamically from eFuses (never stored in NVS)
+  generateDeviceId(config->device.id, sizeof(config->device.id));
+  ESP_LOGI(TAG, "Device ID generated from eFuses: %s", config->device.id);
+
   // Validate and fix any invalid fields
   if (!validateConfig(config, true)) {
     ESP_LOGW(TAG, "Configuration had invalid fields, defaults applied");
@@ -473,12 +500,15 @@ esp_err_t save(const FullConfig *config) {
   // Create a copy to modify
   FullConfig configCopy = *config;
 
+  // Clear device.id - it's generated dynamically from eFuses and never stored in NVS
+  configCopy.device.id[0] = '\0';
+
   // Validate before saving
   if (!validateConfig(&configCopy, true)) {
     ESP_LOGW(TAG, "Configuration corrected before saving");
   }
 
-  // Calculate and set CRC
+  // Calculate and set CRC (device.id is excluded from CRC calculation)
   configCopy.crc32 = calculateCrc32(&configCopy);
 
   // Save to NVS
@@ -558,11 +588,23 @@ void generateDeviceId(char *idOut, size_t maxLen) {
     return;
   }
 
-  // Format as 12-character hex string: AABBCCDDEEFF
-  snprintf(idOut, maxLen, "%02X%02X%02X%02X%02X%02X", mac[0], mac[1], mac[2],
-           mac[3], mac[4], mac[5]);
+  // Format only last 4 bytes (8 hex characters) from MAC: DDEEFF
+  char hexStr[9]; // 8 chars + null terminator
+  snprintf(hexStr, sizeof(hexStr), "%02X%02X%02X%02X", 
+           mac[2], mac[3], mac[4], mac[5]);
 
-  ESP_LOGI(TAG, "Device ID generated from WiFi MAC: %s", idOut);
+  // Transform: if character is a number (0-9), add 17 to convert to letter (A-J)
+  // 0->A, 1->B, 2->C, ..., 9->J
+  for (size_t i = 0; i < 8 && i < maxLen - 1; i++) {
+    if (hexStr[i] >= '0' && hexStr[i] <= '9') {
+      idOut[i] = hexStr[i] + 17; // Convert 0-9 to A-J
+    } else {
+      idOut[i] = hexStr[i]; // Keep A-F as is
+    }
+  }
+  idOut[8] = '\0'; // Ensure null termination
+
+  ESP_LOGI(TAG, "Device ID generated from WiFi MAC (last 4 bytes, numbers->letters): %s", idOut);
 }
 
 // ============== Legacy API (Aliases) ==============
@@ -572,6 +614,8 @@ esp_err_t getConfig(FullConfig *config) {
     return ESP_ERR_INVALID_STATE;
   }
   *config = s_config;
+  // Always generate device ID dynamically from eFuses (never stored in NVS)
+  generateDeviceId(config->device.id, sizeof(config->device.id));
   return ESP_OK;
 }
 

@@ -86,6 +86,7 @@ struct FullConfig {
   struct {
     char host[64] = "mqtt.example.com"; // REQUIRED if ENDPOINT
     uint16_t port = 1883;               // REQUIRED if ENDPOINT (1-65535)
+    uint8_t qos = 1;                    // Quality of Service (0, 1 or 2)
     bool useAuth = false;
     char username[32] = "";                     // REQUIRED if useAuth
     char password[64] = "";                     // REQUIRED if useAuth

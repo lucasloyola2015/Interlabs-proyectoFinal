@@ -9,6 +9,8 @@ idf_component_register(
         "network/ethernet/EthernetW5500.cpp"
         "network/wifi/WifiInterface.cpp"
         "webserver/WebServer.cpp"
+        "mqtt/MqttClient.cpp"
+        "mqtt/MqttManager.cpp"
         "utils/CommandSystem.cpp"
         "utils/ButtonMonitor.cpp"
         "utils/LedManager.cpp"
@@ -23,8 +25,10 @@ idf_component_register(
         "network/ethernet"
         "network/wifi"
         "webserver"
+        "mqtt"
         "config"
         "utils"
     REQUIRES
         w5500
+        mqtt
 )

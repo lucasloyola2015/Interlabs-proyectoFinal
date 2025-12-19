@@ -1,11 +1,15 @@
 #include "WebServer.h"
 #include "../config/ConfigManager.h"
+#include "../mqtt/MqttClient.h"
+#include "../mqtt/MqttManager.h"
 #include "../pipeline/DataPipeline.h"
 #include "../storage/FlashRing.h"
 #include "../transport/TransportTypes.h"
 #include "esp_http_server.h"
 #include "esp_log.h"
 #include "esp_system.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
 #include "logo_data.h"
 #include <cstdio>
 #include <cstring>
@@ -39,6 +43,7 @@ static esp_err_t apiUserConfigHandler(httpd_req_t *req);
 static esp_err_t apiSystemRebootHandler(httpd_req_t *req);
 static esp_err_t apiGetFullConfigHandler(httpd_req_t *req);
 static esp_err_t apiSaveFullConfigHandler(httpd_req_t *req);
+static esp_err_t apiTestMqttHandler(httpd_req_t *req);
 
 esp_err_t init(INetworkInterface *ethInterface,
                INetworkInterface *wifiInterface, uint16_t port) {
@@ -63,7 +68,7 @@ esp_err_t start() {
   httpd_config_t config = HTTPD_DEFAULT_CONFIG();
   config.server_port = s_port;
   config.max_uri_handlers = 20;
-  config.stack_size = 8192;
+  config.stack_size = 12288; // 12KB - sufficient for MQTT test handler (MqttManager + FullConfig need ~3KB)
 
   esp_err_t ret = httpd_start(&s_serverHandle, &config);
   if (ret != ESP_OK) {
@@ -83,6 +88,7 @@ esp_err_t start() {
       {"/api/system/reboot", HTTP_POST, apiSystemRebootHandler},
       {"/api/config", HTTP_GET, apiGetFullConfigHandler},
       {"/api/config", HTTP_POST, apiSaveFullConfigHandler},
+      {"/api/mqtt/test", HTTP_POST, apiTestMqttHandler},
   };
 
   for (const auto &handler : handlers) {
@@ -191,6 +197,8 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Ar
 .btn-danger{background:var(--danger)}
 .btn-secondary{background:var(--border);color:var(--text)}
 .btn-accent{background:var(--accent-hover)}
+.btn-success{background:var(--success)}
+.btn-error{background:var(--danger)}
 .btn .material-symbols-outlined{font-size:20px}
 
 .status-row{display:flex;gap:15px;margin-bottom:20px;flex-wrap:wrap}
@@ -320,7 +328,7 @@ input:checked + .slider:before{transform:translateX(22px)}
     </div>
   </div>
   <div class="form-group">
-    <label>ID del Dispositivo (MAC)</label>
+    <label>ID del Dispositivo</label>
     <span id="devMac" class="mac-label">C0:4E:30:XX:XX:XX</span>
   </div>
 </div>
@@ -465,8 +473,14 @@ input:checked + .slider:before{transform:translateX(22px)}
 <div id="blkMqtt" class="card hidden">
   <h2><span class="material-symbols-outlined">cloud_queue</span> MQTT Broker</h2>
   <div class="form-row">
-    <div class="form-group"><label>Host / IP</label><input type="text" id="mqHost" placeholder="iot.eclipse.org"></div>
+    <div class="form-group" style="display:flex;align-items:flex-end;gap:8px">
+      <div style="flex:1"><label>Host / IP</label><input type="text" id="mqHost" placeholder="iot.eclipse.org"></div>
+      <button class="btn btn-secondary" onclick="testMqttConnection()" id="mqTestBtn" style="white-space:nowrap;padding:10px 16px">
+        <span class="material-symbols-outlined">network_check</span> Test
+      </button>
+    </div>
     <div class="form-group"><label>Puerto</label><input type="number" id="mqPort" value="1883"></div>
+    <div class="form-group"><label>QoS</label><input type="number" id="mqQos" value="1" min="0" max="2"></div>
   </div>
   <div class="switch-group" style="margin-bottom:12px">
     <div style="display:flex;align-items:center;gap:10px"><span class="material-symbols-outlined">security</span> <strong>Usar Autenticación</strong></div>
@@ -538,7 +552,7 @@ function showView(v){
   const btns=document.querySelectorAll('.nav button');
   if(v==='dash'&&btns[0])btns[0].classList.add('active');
   if(v==='config'&&btns[1])btns[1].classList.add('active');
-  if(v==='config'){ loadConfig(); uiUpdateBlocks(); }
+  if(v==='config'){ loadConfig(); }
 }
 
 /* UI Dynamics */
@@ -569,6 +583,80 @@ function uiToggleGroup(prefix, show){
 function uiMqttAuthToggle(show){
   document.getElementById('mqUser').disabled = !show;
   document.getElementById('mqPass').disabled = !show;
+}
+
+function testMqttConnection(){
+  const btn=document.getElementById('mqTestBtn');
+  const host=document.getElementById('mqHost').value;
+  const port=parseInt(document.getElementById('mqPort').value)||1883;
+  const qos=parseInt(document.getElementById('mqQos').value)||1;
+  const useAuth=document.getElementById('mqAuth').checked;
+  const username=document.getElementById('mqUser').value;
+  const password=document.getElementById('mqPass').value;
+  
+  if(!host){
+    const m=document.getElementById('cfgMsg');
+    if(m){m.className='msg err';m.textContent='Por favor ingrese un Host/IP';m.classList.remove('hidden');setTimeout(()=>m.classList.add('hidden'),3000);}
+    return;
+  }
+  
+  if(btn){
+    btn.disabled=true;
+    // Guardar estado original
+    const originalText=btn.innerHTML;
+    const originalClasses=btn.className;
+    // Estado de prueba
+    btn.className='btn btn-secondary';
+    btn.innerHTML='<span class="material-symbols-outlined">hourglass_empty</span> Probando...';
+    
+    const testCfg={
+      host:host,
+      port:port,
+      qos:qos,
+      useAuth:useAuth,
+      username:useAuth?username:'',
+      password:useAuth?password:''
+    };
+    
+    fetch('/api/mqtt/test',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(testCfg)})
+      .then(r=>r.json())
+      .then(d=>{
+        const m=document.getElementById('cfgMsg');
+        if(m){
+          m.className='msg '+(d.success?'ok':'err');
+          m.textContent=d.success?(d.message||'Conexión exitosa'):(d.error||'Error de conexión');
+          m.classList.remove('hidden');
+          setTimeout(()=>m.classList.add('hidden'),5000);
+        }
+        // Cambiar color del botón según resultado
+        if(d.success){
+          btn.className='btn btn-success';
+          btn.innerHTML='<span class="material-symbols-outlined">check_circle</span> OK';
+        }else{
+          btn.className='btn btn-error';
+          btn.innerHTML='<span class="material-symbols-outlined">error</span> Error';
+        }
+        btn.disabled=false;
+        // Restaurar estado original después de 3 segundos
+        setTimeout(()=>{
+          btn.className=originalClasses;
+          btn.innerHTML=originalText;
+        },3000);
+      })
+      .catch(e=>{
+        const m=document.getElementById('cfgMsg');
+        if(m){m.className='msg err';m.textContent='Error de conexión: '+e.message;m.classList.remove('hidden');setTimeout(()=>m.classList.add('hidden'),5000);}
+        // Botón en rojo por error
+        btn.className='btn btn-error';
+        btn.innerHTML='<span class="material-symbols-outlined">error</span> Error';
+        btn.disabled=false;
+        // Restaurar estado original después de 3 segundos
+        setTimeout(()=>{
+          btn.className=originalClasses;
+          btn.innerHTML=originalText;
+        },3000);
+      });
+  }
 }
 
 /* Save Configuration */
@@ -606,7 +694,7 @@ function saveAll(){
       webServerPort:80
     },
     endpoint:{
-      hostName:document.getElementById('epHost')?document.getElementById('epHost').value:'Device01',
+      hostName:document.getElementById('hostName')?document.getElementById('hostName').value:'Device01',
       source:document.getElementById('srcType')&&document.getElementById('srcType').value==='SERIE'?1:0,
       serial:{
         interface:document.getElementById('serInt')&&document.getElementById('serInt').value==='RS485'?1:0,
@@ -619,6 +707,7 @@ function saveAll(){
     mqtt:{
       host:document.getElementById('mqHost')?document.getElementById('mqHost').value:'mqtt.example.com',
       port:parseInt(document.getElementById('mqPort')?document.getElementById('mqPort').value:1883),
+      qos:parseInt(document.getElementById('mqQos')?document.getElementById('mqQos').value:1),
       useAuth:document.getElementById('mqAuth')?document.getElementById('mqAuth').checked:false,
       username:document.getElementById('mqUser')?document.getElementById('mqUser').value:'',
       password:document.getElementById('mqPass')?document.getElementById('mqPass').value:'',
@@ -680,7 +769,12 @@ function refresh(){
 function loadConfig(){
   fetch('/api/config').then(r=>r.json()).then(d=>{
     if(d.device){
-      document.getElementById('devType').value=d.device.type===0?'COORDINADOR':'ENDPOINT';
+      const devTypeEl=document.getElementById('devType');
+      if(devTypeEl){
+        devTypeEl.value=d.device.type===0?'COORDINADOR':'ENDPOINT';
+        // Actualizar bloques después de establecer el tipo de dispositivo
+        uiUpdateBlocks();
+      }
       document.getElementById('devName').value=d.device.name||'';
       const macEl=document.getElementById('devMac');
       if(macEl)macEl.textContent=d.device.id||'';
@@ -689,7 +783,11 @@ function loadConfig(){
       const lanEn=document.getElementById('lanEn');
       if(lanEn){lanEn.checked=d.network.lan.enabled;uiToggleGroup('lan',d.network.lan.enabled);}
       const lanDhcp=document.getElementById('lanDhcp');
-      if(lanDhcp)lanDhcp.value=d.network.lan.useDhcp?'dhcp':'static';
+      if(lanDhcp){
+        lanDhcp.value=d.network.lan.useDhcp?'dhcp':'static';
+        // Actualizar visibilidad de campos IP según el modo DHCP
+        uiToggleSection('lanIpSet', lanDhcp.value==='static');
+      }
       const lanIp=document.getElementById('lanIp');
       if(lanIp)lanIp.value=d.network.lan.staticIp||'';
       const lanMask=document.getElementById('lanMask');
@@ -705,7 +803,17 @@ function loadConfig(){
       const staPass=document.getElementById('staPass');
       if(staPass)staPass.value=d.network.wlanOp.password||'';
       const staDhcp=document.getElementById('staDhcp');
-      if(staDhcp)staDhcp.value=d.network.wlanOp.useDhcp?'dhcp':'static';
+      if(staDhcp){
+        staDhcp.value=d.network.wlanOp.useDhcp?'dhcp':'static';
+        // Actualizar visibilidad de campos IP según el modo DHCP
+        uiToggleSection('staIpSet', staDhcp.value==='static');
+      }
+      const staIp=document.getElementById('staIp');
+      if(staIp)staIp.value=d.network.wlanOp.staticIp||'';
+      const staMask=document.getElementById('staMask');
+      if(staMask)staMask.value=d.network.wlanOp.netmask||'';
+      const staGw=document.getElementById('staGw');
+      if(staGw)staGw.value=d.network.wlanOp.gateway||'';
     }
     if(d.network&&d.network.wlanSafe){
       const apSsid=document.getElementById('apSsid');
@@ -716,13 +824,31 @@ function loadConfig(){
       if(apCh)apCh.value=d.network.wlanSafe.channel||6;
     }
     if(d.endpoint){
-      const epHost=document.getElementById('epHost');
+      const epHost=document.getElementById('hostName');
       if(epHost)epHost.value=d.endpoint.hostName||'';
       const srcType=document.getElementById('srcType');
-      if(srcType)srcType.value=d.endpoint.source===0?'DESHABILITADO':'SERIE';
+      if(srcType){
+        if(d.endpoint.source===1)srcType.value='SERIE';
+        else if(d.endpoint.source===2)srcType.value='PARALELO';
+        else srcType.value='DESHABILITADO';
+        // Actualizar visibilidad del bloque de fuente de datos
+        uiUpdateDataSource();
+      }
       if(d.endpoint.serial){
         const serBaud=document.getElementById('serBaud');
         if(serBaud)serBaud.value=d.endpoint.serial.baudRate||115200;
+        const serIf=document.getElementById('serIf');
+        if(serIf)serIf.value=d.endpoint.serial.interface===1?'RS485':'RS232';
+        const serBits=document.getElementById('serBits');
+        if(serBits)serBits.value=d.endpoint.serial.dataBits||8;
+        const serPari=document.getElementById('serPari');
+        if(serPari){
+          if(d.endpoint.serial.parity===1)serPari.value='even';
+          else if(d.endpoint.serial.parity===2)serPari.value='odd';
+          else serPari.value='none';
+        }
+        const serStop=document.getElementById('serStop');
+        if(serStop)serStop.value=d.endpoint.serial.stopBits===2?2:1;
       }
     }
     if(d.mqtt){
@@ -730,6 +856,8 @@ function loadConfig(){
       if(mqHost)mqHost.value=d.mqtt.host||'';
       const mqPort=document.getElementById('mqPort');
       if(mqPort)mqPort.value=d.mqtt.port||1883;
+      const mqQos=document.getElementById('mqQos');
+      if(mqQos)mqQos.value=d.mqtt.qos!==undefined?d.mqtt.qos:1;
       const mqAuth=document.getElementById('mqAuth');
       if(mqAuth){mqAuth.checked=d.mqtt.useAuth;uiMqttAuthToggle(d.mqtt.useAuth);}
       const mqUser=document.getElementById('mqUser');
@@ -961,6 +1089,7 @@ static esp_err_t apiGetFullConfigHandler(httpd_req_t *req) {
       "\"mqtt\":{"
       "\"host\":\"%s\","
       "\"port\":%d,"
+      "\"qos\":%d,"
       "\"useAuth\":%s,"
       "\"username\":\"%s\","
       "\"password\":\"%s\","
@@ -1006,7 +1135,8 @@ static esp_err_t apiGetFullConfigHandler(httpd_req_t *req) {
       cfg.endpoint.serial.dataBits, (int)cfg.endpoint.serial.parity,
       (int)cfg.endpoint.serial.stopBits,
       // MQTT
-      cfg.mqtt.host, cfg.mqtt.port, cfg.mqtt.useAuth ? "true" : "false",
+      cfg.mqtt.host, cfg.mqtt.port, cfg.mqtt.qos,
+      cfg.mqtt.useAuth ? "true" : "false",
       cfg.mqtt.username, cfg.mqtt.password, cfg.mqtt.topicPub,
       cfg.mqtt.topicSub,
       // Web User
@@ -1040,20 +1170,36 @@ static esp_err_t apiSaveFullConfigHandler(httpd_req_t *req) {
   };
 
   auto parseString = [](const char *pos, char *out, size_t maxLen) {
-    if (!pos)
+    if (!pos || !out || maxLen == 0)
       return;
-    pos = strchr(pos, ':');
-    if (!pos)
+    // Clear output buffer
+    memset(out, 0, maxLen);
+    // pos already points to the key (e.g., "topicPub":)
+    // Find the colon - it should be right after the key
+    const char *colon = strchr(pos, ':');
+    if (!colon)
       return;
-    pos = strchr(pos, '"');
-    if (!pos)
+    // Skip colon
+    colon++;
+    // Skip whitespace after colon
+    while (*colon == ' ' || *colon == '\t')
+      colon++;
+    // Find opening quote
+    const char *quoteStart = strchr(colon, '"');
+    if (!quoteStart)
       return;
-    pos++;
-    size_t i = 0;
-    while (*pos && *pos != '"' && i < maxLen - 1) {
-      out[i++] = *pos++;
-    }
-    out[i] = '\0';
+    // Skip opening quote
+    quoteStart++;
+    // Find closing quote
+    const char *quoteEnd = strchr(quoteStart, '"');
+    if (!quoteEnd)
+      return;
+    // Copy the string between quotes
+    size_t len = quoteEnd - quoteStart;
+    if (len > maxLen - 1)
+      len = maxLen - 1;
+    memcpy(out, quoteStart, len);
+    out[len] = '\0';
   };
 
   auto parseInt = [](const char *pos) -> int {
@@ -1144,17 +1290,44 @@ static esp_err_t apiSaveFullConfigHandler(httpd_req_t *req) {
   // Parse MQTT
   const char *mqtt = strstr(buf, "\"mqtt\"");
   if (mqtt) {
-    parseString(findValue(mqtt, "host"), cfg.mqtt.host, sizeof(cfg.mqtt.host));
-    cfg.mqtt.port = parseInt(findValue(mqtt, "port"));
-    cfg.mqtt.useAuth = parseBool(findValue(mqtt, "useAuth"));
-    parseString(findValue(mqtt, "username"), cfg.mqtt.username,
-                sizeof(cfg.mqtt.username));
-    parseString(findValue(mqtt, "password"), cfg.mqtt.password,
-                sizeof(cfg.mqtt.password));
-    parseString(findValue(mqtt, "topicPub"), cfg.mqtt.topicPub,
-                sizeof(cfg.mqtt.topicPub));
-    parseString(findValue(mqtt, "topicSub"), cfg.mqtt.topicSub,
-                sizeof(cfg.mqtt.topicSub));
+    // Find the opening brace of mqtt object
+    mqtt = strchr(mqtt, '{');
+    if (mqtt) {
+      // Find the closing brace of mqtt object
+      const char *mqttEnd = strchr(mqtt, '}');
+      if (mqttEnd) {
+        // Create a helper that searches only within mqtt section
+        auto findValueInSection = [mqtt, mqttEnd](const char *key) -> const char * {
+          char search[64];
+          snprintf(search, sizeof(search), "\"%s\":", key);
+          const char *pos = strstr(mqtt, search);
+          if (pos && pos < mqttEnd) {
+            return pos;
+          }
+          return nullptr;
+        };
+        
+        parseString(findValueInSection("host"), cfg.mqtt.host, sizeof(cfg.mqtt.host));
+        cfg.mqtt.port = parseInt(findValueInSection("port"));
+        cfg.mqtt.qos = parseInt(findValueInSection("qos"));
+        if (cfg.mqtt.qos > 2) cfg.mqtt.qos = 1; // Validar QoS (0, 1 o 2)
+        cfg.mqtt.useAuth = parseBool(findValueInSection("useAuth"));
+        parseString(findValueInSection("username"), cfg.mqtt.username,
+                    sizeof(cfg.mqtt.username));
+        parseString(findValueInSection("password"), cfg.mqtt.password,
+                    sizeof(cfg.mqtt.password));
+        const char *topicPubPos = findValueInSection("topicPub");
+        if (topicPubPos) {
+          parseString(topicPubPos, cfg.mqtt.topicPub, sizeof(cfg.mqtt.topicPub));
+          ESP_LOGI(TAG, "Parsed topicPub: [%s] (len=%zu)", cfg.mqtt.topicPub, strlen(cfg.mqtt.topicPub));
+        }
+        const char *topicSubPos = findValueInSection("topicSub");
+        if (topicSubPos) {
+          parseString(topicSubPos, cfg.mqtt.topicSub, sizeof(cfg.mqtt.topicSub));
+          ESP_LOGI(TAG, "Parsed topicSub: [%s] (len=%zu)", cfg.mqtt.topicSub, strlen(cfg.mqtt.topicSub));
+        }
+      }
+    }
   }
 
   // Parse WebUser
@@ -1271,6 +1444,211 @@ static esp_err_t apiSystemRebootHandler(httpd_req_t *req) {
   httpd_resp_send(req, "{\"success\":true}", -1);
   vTaskDelay(pdMS_TO_TICKS(1000));
   esp_restart();
+  return ESP_OK;
+}
+
+static esp_err_t apiTestMqttHandler(httpd_req_t *req) {
+  char buf[512];
+  int ret = httpd_req_recv(req, buf, sizeof(buf) - 1);
+  if (ret <= 0) {
+    httpd_resp_send(req, "{\"success\":false,\"error\":\"Failed to receive "
+                         "request\"}",
+                    -1);
+    return ESP_FAIL;
+  }
+  buf[ret] = '\0';
+
+  // Parse JSON (simple parsing)
+  auto findValue = [](const char *json, const char *key) -> const char * {
+    char searchKey[64];
+    snprintf(searchKey, sizeof(searchKey), "\"%s\"", key);
+    const char *keyPos = strstr(json, searchKey);
+    if (!keyPos)
+      return nullptr;
+    const char *colon = strchr(keyPos, ':');
+    if (!colon)
+      return nullptr;
+    const char *valueStart = colon + 1;
+    while (*valueStart == ' ' || *valueStart == '\t')
+      valueStart++;
+    if (*valueStart == '"') {
+      valueStart++;
+      return valueStart;
+    }
+    return valueStart;
+  };
+
+  auto parseString = [](const char *start, char *out, size_t maxLen) {
+    if (!start)
+      return;
+    const char *end = strchr(start, '"');
+    if (end) {
+      size_t len = end - start;
+      if (len > maxLen - 1)
+        len = maxLen - 1;
+      strncpy(out, start, len);
+      out[len] = '\0';
+    } else {
+      // Try to parse as number or boolean
+      strncpy(out, start, maxLen - 1);
+      out[maxLen - 1] = '\0';
+    }
+  };
+
+  auto parseInt = [](const char *str) -> int {
+    if (!str)
+      return 0;
+    return atoi(str);
+  };
+
+  auto parseBool = [](const char *str) -> bool {
+    if (!str)
+      return false;
+    return (strncmp(str, "true", 4) == 0 || strncmp(str, "1", 1) == 0);
+  };
+
+  // Parse MQTT test parameters
+  char host[64] = "";
+  uint16_t port = 1883;
+  uint8_t qos = 1;
+  bool useAuth = false;
+  char username[32] = "";
+  char password[64] = "";
+
+  parseString(findValue(buf, "host"), host, sizeof(host));
+  port = (uint16_t)parseInt(findValue(buf, "port"));
+  if (port == 0)
+    port = 1883;
+  qos = (uint8_t)parseInt(findValue(buf, "qos"));
+  if (qos > 2)
+    qos = 1;
+  useAuth = parseBool(findValue(buf, "useAuth"));
+  if (useAuth) {
+    parseString(findValue(buf, "username"), username, sizeof(username));
+    parseString(findValue(buf, "password"), password, sizeof(password));
+  }
+
+  if (strlen(host) == 0) {
+    httpd_resp_send(req, "{\"success\":false,\"error\":\"Host is required\"}",
+                    -1);
+    return ESP_OK;
+  }
+
+  ESP_LOGI(TAG, "Testing MQTT connection to %s:%d", host, port);
+
+  // Load current config
+  ConfigManager::FullConfig tempConfig;
+  if (ConfigManager::getConfig(&tempConfig) != ESP_OK) {
+    httpd_resp_send(req, "{\"success\":false,\"error\":\"Failed to load base "
+                         "configuration\"}",
+                    -1);
+    return ESP_OK;
+  }
+
+  // Save only MQTT config to restore later (optimize memory usage)
+  struct {
+    char host[64];
+    uint16_t port;
+    uint8_t qos;
+    bool useAuth;
+    char username[32];
+    char password[64];
+  } originalMqtt;
+  memcpy(&originalMqtt, &tempConfig.mqtt, sizeof(originalMqtt));
+
+  // Override MQTT config with test parameters (preserve topics from original config)
+  strncpy(tempConfig.mqtt.host, host, sizeof(tempConfig.mqtt.host) - 1);
+  tempConfig.mqtt.host[sizeof(tempConfig.mqtt.host) - 1] = '\0';
+  tempConfig.mqtt.port = port;
+  tempConfig.mqtt.qos = qos;
+  tempConfig.mqtt.useAuth = useAuth;
+  if (useAuth) {
+    strncpy(tempConfig.mqtt.username, username, sizeof(tempConfig.mqtt.username) - 1);
+    tempConfig.mqtt.username[sizeof(tempConfig.mqtt.username) - 1] = '\0';
+    strncpy(tempConfig.mqtt.password, password, sizeof(tempConfig.mqtt.password) - 1);
+    tempConfig.mqtt.password[sizeof(tempConfig.mqtt.password) - 1] = '\0';
+  }
+  // Topics are preserved (not overridden in test)
+
+  // Temporarily save config for test
+  ConfigManager::saveConfig(&tempConfig);
+
+  // Create temporary MQTT manager for testing (after config is saved)
+  MqttManager testManager;
+
+  // Initialize and connect
+  bool connected = false;
+  bool published = false;
+  esp_err_t initRet = testManager.init();
+  
+  // Reload config to ensure MqttManager uses the temporary test configuration
+  if (initRet == ESP_OK) {
+    testManager.reloadConfig();
+  }
+  if (initRet == ESP_OK) {
+    esp_err_t connectRet = testManager.connect();
+
+    if (connectRet == ESP_OK) {
+      // Wait up to 5 seconds for connection
+      for (int i = 0; i < 50; i++) {
+        vTaskDelay(pdMS_TO_TICKS(100));
+        if (testManager.isConnected()) {
+          connected = true;
+          break;
+        }
+      }
+      
+      // If connected, wait a bit for subscription to complete, then publish test message
+      if (connected) {
+        vTaskDelay(pdMS_TO_TICKS(500)); // Wait for subscription to complete
+        
+        // Publish a test status message using MqttManager API
+        // This will automatically include deviceId, deviceName, status, and timestamp
+        esp_err_t pubRet = testManager.sendStatus("test_connection");
+        if (pubRet == ESP_OK) {
+          published = true;
+          ESP_LOGI(TAG, "Mensaje de prueba (status) publicado usando MqttManager");
+          vTaskDelay(pdMS_TO_TICKS(500)); // Give time for message to be sent
+        }
+        
+        // Keep connected for a bit longer so MQTT Explorer can see it
+        vTaskDelay(pdMS_TO_TICKS(2000)); // Stay connected for 2 more seconds
+      }
+    }
+
+    // Disconnect
+    testManager.disconnect();
+    vTaskDelay(pdMS_TO_TICKS(500)); // Give time to disconnect
+  }
+
+  // Restore original MQTT config (only the MQTT part, not the entire config)
+  memcpy(&tempConfig.mqtt, &originalMqtt, sizeof(originalMqtt));
+  ConfigManager::saveConfig(&tempConfig);
+
+  // Send response
+  if (connected) {
+    char resp[320];
+    if (published) {
+      snprintf(resp, sizeof(resp),
+               "{\"success\":true,\"message\":\"Conexión exitosa a %s:%d. "
+               "Mensaje de prueba publicado en %s. Verifique en MQTT Explorer.\"}",
+               host, port, tempConfig.mqtt.topicPub);
+    } else {
+      snprintf(resp, sizeof(resp),
+               "{\"success\":true,\"message\":\"Conexión exitosa a %s:%d. "
+               "Suscripción realizada. Verifique en MQTT Explorer.\"}",
+               host, port);
+    }
+    httpd_resp_send(req, resp, -1);
+  } else {
+    char resp[256];
+    snprintf(resp, sizeof(resp),
+             "{\"success\":false,\"error\":\"No se pudo conectar a %s:%d. "
+             "Verifique la configuración y la conectividad de red.\"}",
+             host, port);
+    httpd_resp_send(req, resp, -1);
+  }
+
   return ESP_OK;
 }
 
